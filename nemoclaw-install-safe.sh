@@ -8,6 +8,8 @@
 #   - All files are confined to ~/.nemoclaw (source, prefix, bin, config)
 #   - No global npm link -- local prefix only
 #   - trap-based cleanup on failure
+#   - Versioned installs: source-<ver>/ prefix-<ver>/ with symlinks
+#   - --upgrade / --rollback / --prune for lifecycle management
 #   - --uninstall support for clean removal
 #   - --dry-run to preview actions without side effects
 #
@@ -16,20 +18,26 @@
 #   2. REMOVED: Ollama auto-install
 #   3. REMOVED: npm link (replaced with local --prefix install)
 #   4. ADDED:   --uninstall, --dry-run flags
-#   5. ADDED:   trap cleanup on error
-#   6. ADDED:   git clone commit hash recording
+#   5. ADDED:   --upgrade, --rollback, --prune flags
+#   6. ADDED:   trap cleanup on error
+#   7. ADDED:   git clone commit hash recording
+#   8. ADDED:   versioned directory layout with symlinks
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 DEFAULT_NEMOCLAW_VERSION="0.1.0"
-TOTAL_STEPS=3
 
 # All NemoClaw artifacts live under this single directory.
 NEMOCLAW_HOME="${NEMOCLAW_HOME:-${HOME}/.nemoclaw}"
 NEMOCLAW_SOURCE="${NEMOCLAW_HOME}/source"
 NEMOCLAW_PREFIX="${NEMOCLAW_HOME}/prefix"
 NEMOCLAW_BIN="${NEMOCLAW_PREFIX}/bin"
+
+# Version tracking
+NEMOCLAW_ACTIVE_FILE="${NEMOCLAW_HOME}/.active-version"
+NEMOCLAW_HISTORY_FILE="${NEMOCLAW_HOME}/.version-history"
+NEMOCLAW_HISTORY_MAX=3
 
 # Flags
 DRY_RUN=""
@@ -38,6 +46,7 @@ NON_INTERACTIVE=""
 # Track partial install for cleanup
 _INSTALL_STARTED=""
 _INSTALL_START=""
+_INSTALL_VERSION=""
 _BACKUP_DIR=""
 _EXIT_CODE=0
 
@@ -85,13 +94,261 @@ ok()    { printf "  ${C_GREEN}*${C_RESET}  %s\n" "$*"; }
 dry()   { printf "  ${C_DIM}[dry-run]${C_RESET} %s\n" "$*"; }
 
 step() {
-  local n=$1 msg=$2
+  local n=$1 total=$2 msg=$3
   printf "\n${C_GREEN}[%s/%s]${C_RESET} ${C_BOLD}%s${C_RESET}\n" \
-    "$n" "$TOTAL_STEPS" "$msg"
+    "$n" "$total" "$msg"
   printf "  ${C_DIM}------------------------------------------------------${C_RESET}\n"
 }
 
 command_exists() { command -v "$1" &>/dev/null; }
+
+# ---------------------------------------------------------------------------
+# Version string validation
+# ---------------------------------------------------------------------------
+validate_version_string() {
+  local v="$1"
+  if [[ -z "$v" ]]; then
+    error "Empty version string."
+  fi
+  if [[ "$v" == *..* ]]; then
+    error "Version string contains '..': '${v}'"
+  fi
+  if [[ ! "$v" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]]; then
+    error "Invalid version string: '${v}' -- must match [a-zA-Z0-9._+-]"
+  fi
+}
+
+is_semver_like() {
+  [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]
+}
+
+# ---------------------------------------------------------------------------
+# Atomic symlink helper
+# ---------------------------------------------------------------------------
+_atomic_symlink() {
+  local target="$1" link_path="$2"
+  local tmp_link="${link_path}.tmp.$$"
+  rm -f "$tmp_link"
+  ln -s "$target" "$tmp_link"
+  # mv -T is atomic (rename(2)) on Linux; fall back to ln -sfn elsewhere
+  if mv -T "$tmp_link" "$link_path" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp_link"
+  ln -sfn "$target" "$link_path"
+}
+
+# ---------------------------------------------------------------------------
+# Version management
+# ---------------------------------------------------------------------------
+get_active_version() {
+  [[ -f "$NEMOCLAW_ACTIVE_FILE" ]] && tr -d '[:space:]' < "$NEMOCLAW_ACTIVE_FILE" || true
+}
+
+# Return the most recent entry from the version history stack
+get_previous_version() {
+  [[ -f "$NEMOCLAW_HISTORY_FILE" ]] && head -1 "$NEMOCLAW_HISTORY_FILE" | tr -d '[:space:]' || true
+}
+
+# Push a version onto the history stack (max NEMOCLAW_HISTORY_MAX entries)
+push_version_history() {
+  local version="$1"
+  [[ -z "$version" ]] && return 0
+  local tmp="${NEMOCLAW_HISTORY_FILE}.tmp.$$"
+  if [[ -f "$NEMOCLAW_HISTORY_FILE" ]]; then
+    # Remove duplicates then prepend
+    { printf '%s\n' "$version"
+      grep -vxF "$version" "$NEMOCLAW_HISTORY_FILE" || true
+    } | head -n "$NEMOCLAW_HISTORY_MAX" > "$tmp"
+  else
+    printf '%s\n' "$version" > "$tmp"
+  fi
+  mv -f "$tmp" "$NEMOCLAW_HISTORY_FILE"
+}
+
+# Pop the most recent entry from the history stack
+pop_version_history() {
+  if [[ -f "$NEMOCLAW_HISTORY_FILE" ]]; then
+    local tmp="${NEMOCLAW_HISTORY_FILE}.tmp.$$"
+    tail -n +2 "$NEMOCLAW_HISTORY_FILE" > "$tmp"
+    if [[ -s "$tmp" ]]; then
+      mv -f "$tmp" "$NEMOCLAW_HISTORY_FILE"
+    else
+      rm -f "$tmp" "$NEMOCLAW_HISTORY_FILE"
+    fi
+  fi
+}
+
+# Remove a specific version from the history stack
+remove_from_version_history() {
+  local version="$1"
+  if [[ -f "$NEMOCLAW_HISTORY_FILE" ]]; then
+    local tmp="${NEMOCLAW_HISTORY_FILE}.tmp.$$"
+    grep -vxF "$version" "$NEMOCLAW_HISTORY_FILE" > "$tmp" || true
+    if [[ -s "$tmp" ]]; then
+      mv -f "$tmp" "$NEMOCLAW_HISTORY_FILE"
+    else
+      rm -f "$tmp" "$NEMOCLAW_HISTORY_FILE"
+    fi
+  fi
+}
+
+versioned_source() {
+  # Defense-in-depth: reject obviously dangerous strings even if caller forgot to validate
+  [[ "$1" == */* || "$1" == *..* ]] && error "Unsafe version string in versioned_source: '$1'"
+  printf '%s/source-%s' "$NEMOCLAW_HOME" "$1"
+}
+versioned_prefix() {
+  [[ "$1" == */* || "$1" == *..* ]] && error "Unsafe version string in versioned_prefix: '$1'"
+  printf '%s/prefix-%s' "$NEMOCLAW_HOME" "$1"
+}
+
+# List all installed version tags (sorted by version, newest first)
+list_installed_versions() {
+  local v
+  for d in "${NEMOCLAW_HOME}"/source-*/; do
+    [[ -d "$d" ]] || continue
+    v="${d%/}"
+    v="${v##*/source-}"
+    printf '%s\n' "$v"
+  done | (sort -rV 2>/dev/null || sort -r)
+}
+
+# Resolve version string from a source directory's package.json
+resolve_source_version() {
+  local src_dir="$1"
+  if command_exists node && [[ -f "${src_dir}/package.json" ]]; then
+    local v
+    v="$(node -e '
+      const p=require(require("path").join(process.argv[1],"package.json"));
+      const v=p.version||"";
+      if(/^v?\d+\.\d+\.\d+/.test(v)){process.stdout.write(v)}
+    ' "$src_dir" 2>/dev/null || true)"
+    if [[ -n "$v" ]]; then
+      [[ "$v" == v* ]] || v="v${v}"
+      printf '%s' "$v"
+    fi
+  fi
+}
+
+# Activate a version: update symlinks and .active-version file.
+# Callers are responsible for managing the version history stack.
+activate_version() {
+  local new_version="$1"
+  validate_version_string "$new_version"
+
+  local src_versioned pfx_versioned
+  src_versioned="$(versioned_source "$new_version")"
+  pfx_versioned="$(versioned_prefix "$new_version")"
+
+  # Accept both real directories and symlinks whose target exists
+  if [[ ! -d "$src_versioned" && ! ( -L "$src_versioned" && -d "$(readlink -f "$src_versioned")" ) ]]; then
+    error "Source directory not found: $src_versioned"
+  fi
+  [[ -d "$pfx_versioned" ]] || error "Prefix directory not found: $pfx_versioned"
+
+  # Atomic symlink update (relative targets so the tree is relocatable)
+  _atomic_symlink "source-${new_version}" "${NEMOCLAW_HOME}/source"
+  _atomic_symlink "prefix-${new_version}" "${NEMOCLAW_HOME}/prefix"
+
+  printf '%s\n' "$new_version" > "$NEMOCLAW_ACTIVE_FILE"
+  ok "Active version: ${new_version}"
+}
+
+# Fetch latest stable release tag from GitHub
+fetch_latest_release_tag() {
+  local tag=""
+  local api_url="https://api.github.com/repos/NVIDIA/NemoClaw/releases/latest"
+
+  # Try GitHub Releases API (curl + node for JSON parsing, with semver validation)
+  if command_exists curl && command_exists node; then
+    tag="$(curl -fsSL --max-time 10 "$api_url" 2>/dev/null | node -e '
+      let d="";process.stdin.on("data",c=>d+=c);
+      process.stdin.on("end",()=>{
+        try{
+          const t=JSON.parse(d).tag_name||"";
+          if(/^v?\d+\.\d+\.\d+/.test(t)){process.stdout.write(t)}
+        }catch{}
+      })
+    ' 2>/dev/null || true)"
+  fi
+
+  # Fallback: git ls-remote tags (pick latest semver tag)
+  if [[ -z "$tag" ]]; then
+    tag="$(git ls-remote --tags --sort=-v:refname https://github.com/NVIDIA/NemoClaw.git 2>/dev/null \
+      | sed -nE 's|.*refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
+      | head -1 || true)"
+  fi
+
+  if [[ -z "$tag" ]]; then
+    error "Could not determine latest release tag. Check network connectivity."
+  fi
+
+  validate_version_string "$tag"
+  printf '%s' "$tag"
+}
+
+# Migrate legacy (non-versioned) layout to versioned layout
+migrate_legacy_layout() {
+  # Migrate .previous-version -> .version-history (one-time)
+  local legacy_prev="${NEMOCLAW_HOME}/.previous-version"
+  if [[ -f "$legacy_prev" && ! -f "$NEMOCLAW_HISTORY_FILE" ]]; then
+    mv "$legacy_prev" "$NEMOCLAW_HISTORY_FILE"
+  elif [[ -f "$legacy_prev" && -f "$NEMOCLAW_HISTORY_FILE" ]]; then
+    rm -f "$legacy_prev"
+  fi
+
+  # Skip if source is already a symlink or doesn't exist
+  if [[ -L "${NEMOCLAW_HOME}/source" ]] || [[ ! -d "${NEMOCLAW_HOME}/source" ]]; then
+    return 0
+  fi
+
+  if [[ -n "$DRY_RUN" ]]; then
+    dry "Would migrate legacy (non-versioned) layout to versioned layout"
+    return 0
+  fi
+
+  info "Detected legacy (non-versioned) layout -- migrating..."
+  local legacy_version=""
+
+  # Try git tag from recorded commit
+  if [[ -f "${NEMOCLAW_HOME}/source/.install-commit" ]]; then
+    local commit
+    commit="$(head -1 "${NEMOCLAW_HOME}/source/.install-commit")"
+    legacy_version="$(git -C "${NEMOCLAW_HOME}/source" describe --tags --exact-match "$commit" 2>/dev/null || true)"
+  fi
+
+  # Try package.json version (with semver validation)
+  if [[ -z "$legacy_version" ]] && command_exists node; then
+    legacy_version="$(node -e '
+      const p=require(require("path").join(process.argv[1],"package.json"));
+      const v=p.version||"";
+      if(/^v?\d+\.\d+\.\d+/.test(v)){process.stdout.write(v.startsWith("v")?v:"v"+v)}
+    ' "${NEMOCLAW_HOME}/source" 2>/dev/null || true)"
+  fi
+
+  [[ -z "$legacy_version" || "$legacy_version" == "v" ]] && legacy_version="legacy"
+
+  validate_version_string "$legacy_version"
+
+  mv "${NEMOCLAW_HOME}/source" "${NEMOCLAW_HOME}/source-${legacy_version}"
+  if [[ -d "${NEMOCLAW_HOME}/prefix" && ! -L "${NEMOCLAW_HOME}/prefix" ]]; then
+    mv "${NEMOCLAW_HOME}/prefix" "${NEMOCLAW_HOME}/prefix-${legacy_version}"
+  fi
+  activate_version "$legacy_version"
+  ok "Migrated legacy layout to version: ${legacy_version}"
+}
+
+# Check if version $1 is older than version $2 (semver-like only)
+is_version_older() {
+  local v1="$1" v2="$2"
+  [[ "$v1" == "$v2" ]] && return 1
+  # Only compare semver-like versions; non-semver is incomparable
+  is_semver_like "$v1" && is_semver_like "$v2" || return 1
+  local oldest
+  oldest="$(printf '%s\n%s\n' "$v1" "$v2" | (sort -V 2>/dev/null || sort) | head -1)"
+  [[ "$oldest" == "$v1" ]]
+}
 
 # ---------------------------------------------------------------------------
 # Validate NEMOCLAW_HOME -- refuse system directories
@@ -156,36 +413,44 @@ spin() {
 }
 
 # ---------------------------------------------------------------------------
-# Backup / restore for safe reinstall
+# Backup / restore for safe reinstall (versioned)
 # ---------------------------------------------------------------------------
 backup_existing() {
-  if [[ -d "$NEMOCLAW_SOURCE" || -d "$NEMOCLAW_PREFIX" ]]; then
+  local version="$1"
+  local src pfx
+  src="$(versioned_source "$version")"
+  pfx="$(versioned_prefix "$version")"
+  if [[ -d "$src" || -d "$pfx" ]]; then
     _BACKUP_DIR="${NEMOCLAW_HOME}/.backup-$(date +%s)-$$"
     mkdir -p "$_BACKUP_DIR"
-    info "Existing installation detected -- backing up to $_BACKUP_DIR"
-    if [[ -d "$NEMOCLAW_SOURCE" ]]; then mv "$NEMOCLAW_SOURCE" "$_BACKUP_DIR/source"; fi
-    if [[ -d "$NEMOCLAW_PREFIX" ]]; then mv "$NEMOCLAW_PREFIX" "$_BACKUP_DIR/prefix"; fi
+    info "Existing v${version} detected -- backing up to $_BACKUP_DIR"
+    [[ -d "$src" ]] && mv "$src" "$_BACKUP_DIR/source"
+    [[ -d "$pfx" ]] && mv "$pfx" "$_BACKUP_DIR/prefix"
   fi
 }
 
 restore_from_backup() {
-  if [[ -n "$_BACKUP_DIR" && -d "$_BACKUP_DIR" ]]; then
-    warn "Restoring previous installation from backup..."
+  local version="$1"
+  if [[ -n "${_BACKUP_DIR:-}" && -d "$_BACKUP_DIR" ]]; then
+    warn "Restoring previous v${version} from backup..."
+    local src pfx
+    src="$(versioned_source "$version")"
+    pfx="$(versioned_prefix "$version")"
     if [[ -d "$_BACKUP_DIR/source" ]]; then
-      rm -rf "$NEMOCLAW_SOURCE"
-      mv "$_BACKUP_DIR/source" "$NEMOCLAW_SOURCE"
+      rm -rf "$src"
+      mv "$_BACKUP_DIR/source" "$src"
     fi
     if [[ -d "$_BACKUP_DIR/prefix" ]]; then
-      rm -rf "$NEMOCLAW_PREFIX"
-      mv "$_BACKUP_DIR/prefix" "$NEMOCLAW_PREFIX"
+      rm -rf "$pfx"
+      mv "$_BACKUP_DIR/prefix" "$pfx"
     fi
     rm -rf "$_BACKUP_DIR"
-    info "Previous installation restored."
+    info "Previous v${version} restored."
   fi
 }
 
 remove_backup() {
-  if [[ -n "$_BACKUP_DIR" && -d "$_BACKUP_DIR" ]]; then
+  if [[ -n "${_BACKUP_DIR:-}" && -d "$_BACKUP_DIR" ]]; then
     rm -rf "$_BACKUP_DIR"
   fi
 }
@@ -224,11 +489,16 @@ cleanup_on_exit() {
   local ec=$?
   if [[ ${_EXIT_CODE:-0} -ne 0 || $ec -ne 0 ]] && [[ -n "${_INSTALL_STARTED:-}" ]]; then
     warn "Installation failed -- cleaning up partial install..."
-    # Remove the failed partial artifacts
-    if [[ -d "$NEMOCLAW_SOURCE" ]]; then rm -rf "$NEMOCLAW_SOURCE"; fi
-    if [[ -d "$NEMOCLAW_PREFIX" ]]; then rm -rf "$NEMOCLAW_PREFIX"; fi
-    # Restore previous working installation if we had one
-    restore_from_backup
+    if [[ -n "${_INSTALL_VERSION:-}" ]]; then
+      local src pfx
+      src="$(versioned_source "$_INSTALL_VERSION")"
+      pfx="$(versioned_prefix "$_INSTALL_VERSION")"
+      [[ -d "$src" ]] && rm -rf "$src"
+      [[ -d "$pfx" ]] && rm -rf "$pfx"
+      restore_from_backup "$_INSTALL_VERSION"
+    fi
+    # Clean up temp clone directory
+    rm -rf "${NEMOCLAW_HOME}/.clone-tmp-$$"
     warn "Fix the issue above and re-run."
   fi
   release_lock
@@ -326,9 +596,14 @@ print_done() {
   fi
   local sandbox_name
   sandbox_name="$(resolve_default_sandbox_name)"
+  local active_ver
+  active_ver="$(get_active_version)"
   info "=== Installation complete ==="
   printf "\n"
   printf "  ${C_GREEN}${C_BOLD}NemoClaw${C_RESET}  ${C_DIM}(%ss)${C_RESET}\n" "$elapsed"
+  if [[ -n "$active_ver" ]]; then
+    printf "  ${C_DIM}Version: %s${C_RESET}\n" "$active_ver"
+  fi
   printf "\n"
   printf "  ${C_GREEN}Your OpenClaw Sandbox is live.${C_RESET}\n"
   printf "\n"
@@ -380,9 +655,17 @@ usage() {
   printf "  ${C_DIM}Options:${C_RESET}\n"
   printf "    --non-interactive    Skip prompts (uses env vars / defaults)\n"
   printf "    --dry-run            Preview actions without making changes\n"
+  printf "    --upgrade            Upgrade to the latest stable release\n"
+  printf "    --rollback           Roll back to the previous version\n"
+  printf "    --prune              Remove versions older than the active one\n"
   printf "    --uninstall          Remove NemoClaw and all its artifacts\n"
   printf "    --version, -v        Print installer version and exit\n"
   printf "    --help, -h           Show this help message and exit\n\n"
+  printf "  ${C_DIM}Lifecycle:${C_RESET}\n"
+  printf "    Install:   bash nemoclaw-install-safe.sh\n"
+  printf "    Upgrade:   bash nemoclaw-install-safe.sh --upgrade\n"
+  printf "    Rollback:  bash nemoclaw-install-safe.sh --rollback\n"
+  printf "    Prune:     bash nemoclaw-install-safe.sh --prune\n\n"
   printf "  ${C_DIM}Environment:${C_RESET}\n"
   printf "    NVIDIA_API_KEY                API key (skips credential prompt)\n"
   printf "    NEMOCLAW_HOME                 Base directory (default: ~/.nemoclaw)\n"
@@ -542,8 +825,7 @@ install_nemoclaw() {
   _INSTALL_START="${SECONDS}"
   _INSTALL_STARTED="1"
 
-  # Back up existing installation before touching anything
-  backup_existing
+  migrate_legacy_layout
 
   local install_from_source=""
 
@@ -568,40 +850,74 @@ install_nemoclaw() {
 
   if [[ -n "$DRY_RUN" ]]; then
     if [[ "$install_from_source" == "local" ]]; then
-      dry "Would install from current directory to $NEMOCLAW_PREFIX"
+      dry "Would install from current directory to versioned prefix"
     else
-      dry "Would clone https://github.com/NVIDIA/NemoClaw.git to $NEMOCLAW_SOURCE"
+      dry "Would clone https://github.com/NVIDIA/NemoClaw.git"
       dry "Would install dependencies with --ignore-scripts"
       dry "Would build nemoclaw plugin"
-      dry "Would install CLI to $NEMOCLAW_PREFIX (npm --prefix)"
+      dry "Would install CLI to versioned prefix (npm --prefix)"
     fi
     return 0
   fi
 
   local src_dir
   if [[ "$install_from_source" == "local" ]]; then
-    src_dir="$(pwd)"
+    src_dir="$(pwd -P)"
+    # Determine version for local install
+    if [[ -z "$_INSTALL_VERSION" ]]; then
+      _INSTALL_VERSION="$(resolve_source_version "$src_dir")"
+      [[ -z "$_INSTALL_VERSION" ]] && _INSTALL_VERSION="local"
+    fi
+    validate_version_string "$_INSTALL_VERSION"
+    # Create a symlink from versioned source to local directory
+    local target_src
+    target_src="$(versioned_source "$_INSTALL_VERSION")"
+    if [[ ! -e "$target_src" ]]; then
+      ln -s "$src_dir" "$target_src"
+    fi
+    warn "Local install: source-${_INSTALL_VERSION} is a symlink to ${src_dir}."
+    warn "If that directory is moved or deleted, this installation will break."
   else
-    rm -rf "$NEMOCLAW_SOURCE"
-    mkdir -p "$(dirname "$NEMOCLAW_SOURCE")"
+    # Clone to temporary directory first
+    local clone_tmp="${NEMOCLAW_HOME}/.clone-tmp-$$"
+    rm -rf "$clone_tmp"
+    mkdir -p "$(dirname "$clone_tmp")"
+
     local git_ref="${NEMOCLAW_GIT_REF:-}"
     if [[ -n "$git_ref" ]]; then
-      spin "Cloning NemoClaw source (ref: ${git_ref})" git clone --depth 1 --branch "$git_ref" https://github.com/NVIDIA/NemoClaw.git "$NEMOCLAW_SOURCE"
+      spin "Cloning NemoClaw source (ref: ${git_ref})" git clone --depth 1 --branch "$git_ref" https://github.com/NVIDIA/NemoClaw.git "$clone_tmp"
     else
-      spin "Cloning NemoClaw source (HEAD)" git clone --depth 1 https://github.com/NVIDIA/NemoClaw.git "$NEMOCLAW_SOURCE"
+      spin "Cloning NemoClaw source (HEAD)" git clone --depth 1 https://github.com/NVIDIA/NemoClaw.git "$clone_tmp"
     fi
 
     # Record the commit hash for audit/reproducibility
     local commit_hash
-    commit_hash="$(git -C "$NEMOCLAW_SOURCE" rev-parse HEAD 2>/dev/null || echo "unknown")"
-    printf "%s\n" "$commit_hash" > "${NEMOCLAW_SOURCE}/.install-commit"
+    commit_hash="$(git -C "$clone_tmp" rev-parse HEAD 2>/dev/null || echo "unknown")"
+    printf "%s\n" "$commit_hash" > "${clone_tmp}/.install-commit"
     info "Cloned at commit: ${commit_hash}"
     if [[ -z "$git_ref" ]]; then
       warn "No NEMOCLAW_GIT_REF set -- cloned unpinned HEAD. Consider setting NEMOCLAW_GIT_REF=v<version> for reproducibility."
     fi
 
-    src_dir="$NEMOCLAW_SOURCE"
+    # Determine version from source
+    if [[ -z "$_INSTALL_VERSION" ]]; then
+      _INSTALL_VERSION="$(resolve_source_version "$clone_tmp")"
+      if [[ -z "$_INSTALL_VERSION" ]]; then
+        _INSTALL_VERSION="${git_ref:-HEAD-${commit_hash:0:8}}"
+      fi
+    fi
+    validate_version_string "$_INSTALL_VERSION"
+
+    # Move clone to versioned directory
+    local target_src
+    target_src="$(versioned_source "$_INSTALL_VERSION")"
+    backup_existing "$_INSTALL_VERSION"
+    rm -rf "$target_src"
+    mv "$clone_tmp" "$target_src"
+    src_dir="$target_src"
   fi
+
+  info "Installing version: ${_INSTALL_VERSION}"
 
   spin "Preparing OpenClaw package" bash -c "$(declare -p C_CYAN C_YELLOW C_RED C_GREEN C_DIM C_RESET 2>/dev/null || true); $(declare -f command_exists info warn pre_extract_openclaw); pre_extract_openclaw \"\$1\"" _ "$src_dir" \
     || warn "Pre-extraction failed -- npm install may fail if openclaw tarball is broken"
@@ -609,13 +925,16 @@ install_nemoclaw() {
   spin "Installing NemoClaw dependencies" bash -c "cd \"\$1\" && npm install --ignore-scripts" _ "$src_dir"
   spin "Building NemoClaw plugin" bash -c "cd \"\$1\"/nemoclaw && npm install --ignore-scripts && npm run build" _ "$src_dir"
 
-  # Install to local prefix instead of global npm link
-  mkdir -p "$NEMOCLAW_PREFIX"
-  spin "Installing NemoClaw CLI to local prefix" bash -c "cd \"\$1\" && npm install --global --prefix \"\$2\" --ignore-scripts ." _ "$src_dir" "$NEMOCLAW_PREFIX"
+  # Install to versioned prefix
+  local target_pfx
+  target_pfx="$(versioned_prefix "$_INSTALL_VERSION")"
+  mkdir -p "$target_pfx"
+  spin "Installing NemoClaw CLI to local prefix" bash -c "cd \"\$1\" && npm install --global --prefix \"\$2\" --ignore-scripts ." _ "$src_dir" "$target_pfx"
 
   # Fallback: if package.json has no "bin" field, npm won't create bin/nemoclaw.
   # Create a manual wrapper in that case.
-  if [[ ! -x "${NEMOCLAW_BIN}/nemoclaw" ]]; then
+  local target_bin="${target_pfx}/bin"
+  if [[ ! -x "${target_bin}/nemoclaw" ]]; then
     local main_entry
     main_entry="$(node -e '
       const p = require(require("path").join(process.argv[1], "package.json"));
@@ -635,14 +954,22 @@ install_nemoclaw() {
     elif [[ ! -f "${src_dir}/${main_entry}" ]]; then
       error "Entry point '${main_entry}' does not exist in ${src_dir}"
     else
-      mkdir -p "$NEMOCLAW_BIN"
-      cat > "${NEMOCLAW_BIN}/nemoclaw" <<SHIM
+      mkdir -p "$target_bin"
+      cat > "${target_bin}/nemoclaw" <<SHIM
 #!/usr/bin/env bash
 exec node "${src_dir}/${main_entry}" "\$@"
 SHIM
-      chmod +x "${NEMOCLAW_BIN}/nemoclaw"
-      info "Created manual wrapper at ${NEMOCLAW_BIN}/nemoclaw -> ${src_dir}/${main_entry}"
+      chmod +x "${target_bin}/nemoclaw"
+      info "Created manual wrapper at ${target_bin}/nemoclaw -> ${src_dir}/${main_entry}"
     fi
+  fi
+
+  # Activate this version (create/update symlinks)
+  local old_active
+  old_active="$(get_active_version)"
+  activate_version "$_INSTALL_VERSION"
+  if [[ -n "$old_active" && "$old_active" != "$_INSTALL_VERSION" ]]; then
+    push_version_history "$old_active"
   fi
 
   # Install succeeded -- remove backup
@@ -703,16 +1030,240 @@ run_onboard() {
 }
 
 # ---------------------------------------------------------------------------
+# Upgrade
+# ---------------------------------------------------------------------------
+do_upgrade() {
+  printf "\n"
+  info "=== NemoClaw Upgrade ==="
+  printf "\n"
+
+  migrate_legacy_layout
+
+  local current_version
+  current_version="$(get_active_version)"
+
+  info "Fetching latest release tag..."
+  local latest_tag
+  latest_tag="$(fetch_latest_release_tag)"
+  info "Latest release: ${latest_tag}"
+
+  if [[ -n "$current_version" ]]; then
+    info "Current version: ${current_version}"
+  fi
+
+  if [[ -n "$current_version" && "$current_version" == "$latest_tag" ]]; then
+    ok "Already up to date: ${current_version}"
+    exit 0
+  fi
+
+  # Check if this version is already installed (e.g. rolled back from it)
+  local existing_src existing_pfx
+  existing_src="$(versioned_source "$latest_tag")"
+  existing_pfx="$(versioned_prefix "$latest_tag")"
+
+  if [[ -d "$existing_src" && -d "$existing_pfx" ]]; then
+    info "Version ${latest_tag} is already installed. Re-activating..."
+    if [[ -n "$DRY_RUN" ]]; then
+      dry "Would re-activate version ${latest_tag}"
+      exit 0
+    fi
+    local old_active
+    old_active="$(get_active_version)"
+    activate_version "$latest_tag"
+    if [[ -n "$old_active" && "$old_active" != "$latest_tag" ]]; then
+      push_version_history "$old_active"
+    fi
+    verify_nemoclaw
+    printf "\n"
+    info "=== Upgrade complete: ${current_version:-none} -> ${latest_tag} (re-activated) ==="
+    printf "\n"
+    exit 0
+  fi
+
+  if [[ -n "$DRY_RUN" ]]; then
+    dry "Would upgrade: ${current_version:-none} -> ${latest_tag}"
+    dry "Would clone https://github.com/NVIDIA/NemoClaw.git (ref: ${latest_tag})"
+    dry "Would build and install to versioned prefix"
+    exit 0
+  fi
+
+  # Full install of new version
+  _INSTALL_VERSION="$latest_tag"
+  export NEMOCLAW_GIT_REF="$latest_tag"
+
+  print_banner
+
+  step 1 2 "Node.js"
+  check_nodejs
+
+  step 2 2 "NemoClaw CLI (${latest_tag})"
+  install_nemoclaw
+  verify_nemoclaw
+
+  printf "\n"
+  info "=== Upgrade complete: ${current_version:-none} -> ${latest_tag} ==="
+  printf "\n"
+}
+
+# ---------------------------------------------------------------------------
+# Rollback
+# ---------------------------------------------------------------------------
+do_rollback() {
+  printf "\n"
+  info "=== NemoClaw Rollback ==="
+  printf "\n"
+
+  migrate_legacy_layout
+
+  local current_version previous_version
+  current_version="$(get_active_version)"
+  previous_version="$(get_previous_version)"
+
+  if [[ -z "$previous_version" ]]; then
+    error "No previous version found. Nothing to roll back to."
+  fi
+
+  info "Current version:  ${current_version:-none}"
+  info "Previous version: ${previous_version}"
+
+  # Show remaining history
+  if [[ -f "$NEMOCLAW_HISTORY_FILE" ]]; then
+    local depth
+    depth="$(wc -l < "$NEMOCLAW_HISTORY_FILE" | tr -d ' ')"
+    info "History depth: ${depth} version(s)"
+  fi
+
+  # Verify previous version directories exist
+  local prev_src prev_pfx
+  prev_src="$(versioned_source "$previous_version")"
+  prev_pfx="$(versioned_prefix "$previous_version")"
+
+  if [[ ! -d "$prev_src" || ! -d "$prev_pfx" ]]; then
+    error "Previous version ${previous_version} directories are missing. Cannot roll back."
+  fi
+
+  if [[ -n "$DRY_RUN" ]]; then
+    dry "Would roll back: ${current_version} -> ${previous_version}"
+    exit 0
+  fi
+
+  activate_version "$previous_version"
+  pop_version_history
+
+  verify_nemoclaw
+
+  printf "\n"
+  info "=== Rollback complete: ${current_version} -> ${previous_version} ==="
+  info "Run --upgrade to return to ${current_version}."
+  printf "\n"
+}
+
+# ---------------------------------------------------------------------------
+# Prune
+# ---------------------------------------------------------------------------
+do_prune() {
+  printf "\n"
+  info "=== NemoClaw Prune ==="
+  printf "\n"
+
+  migrate_legacy_layout
+
+  local active_version
+  active_version="$(get_active_version)"
+
+  if [[ -z "$active_version" ]]; then
+    error "No active version found. Nothing to prune."
+  fi
+
+  info "Active version: ${active_version}"
+
+  if ! is_semver_like "$active_version"; then
+    warn "Active version '${active_version}' is not semver-like. Cannot determine which versions are older."
+    warn "Prune only works when the active version follows semver (e.g. v1.2.3)."
+    exit 1
+  fi
+
+  # Collect versions older than active (skip non-semver)
+  local to_remove=()
+  local skipped=()
+  local v
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    [[ "$v" == "$active_version" ]] && continue
+    if ! is_semver_like "$v"; then
+      skipped+=("$v")
+      continue
+    fi
+    if is_version_older "$v" "$active_version"; then
+      to_remove+=("$v")
+    fi
+  done < <(list_installed_versions)
+
+  if [[ ${#skipped[@]} -gt 0 ]]; then
+    warn "Skipped non-semver versions (cannot compare): ${skipped[*]}"
+  fi
+
+  if [[ ${#to_remove[@]} -eq 0 ]]; then
+    ok "Nothing to prune. No versions older than ${active_version}."
+    exit 0
+  fi
+
+  info "The following versions will be removed:"
+  for v in "${to_remove[@]}"; do
+    local src pfx size="?"
+    src="$(versioned_source "$v")"
+    pfx="$(versioned_prefix "$v")"
+    if command_exists du; then
+      size="$(du -shc "$src" "$pfx" 2>/dev/null | tail -1 | cut -f1 || echo "?")"
+    fi
+    printf "  - %s  (%s)\n" "$v" "$size"
+  done
+  printf "\n"
+
+  if [[ -n "$DRY_RUN" ]]; then
+    for v in "${to_remove[@]}"; do
+      dry "Would remove: source-${v}/ prefix-${v}/"
+    done
+    exit 0
+  fi
+
+  if [[ "$NON_INTERACTIVE" != "1" ]]; then
+    printf "  Continue? [y/N] "
+    read -r answer
+    if [[ "$answer" != [yY] ]]; then
+      info "Prune cancelled."
+      exit 0
+    fi
+  fi
+
+  for v in "${to_remove[@]}"; do
+    local src pfx
+    src="$(versioned_source "$v")"
+    pfx="$(versioned_prefix "$v")"
+    rm -rf "$src" "$pfx"
+    ok "Removed: ${v}"
+    remove_from_version_history "$v"
+  done
+
+  printf "\n"
+  info "=== Prune complete: removed ${#to_remove[@]} version(s) ==="
+  printf "\n"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
-  local do_uninstall=""
+  local mode=""
 
   for arg in "$@"; do
     case "$arg" in
       --non-interactive) NON_INTERACTIVE=1 ;;
       --dry-run)         DRY_RUN=1 ;;
-      --uninstall)       do_uninstall=1 ;;
+      --uninstall)       mode="uninstall" ;;
+      --upgrade)         mode="upgrade" ;;
+      --rollback)        mode="rollback" ;;
+      --prune)           mode="prune" ;;
       --version | -v)
         printf "nemoclaw-installer v%s (safe)\n" "$NEMOCLAW_VERSION"
         exit 0
@@ -734,31 +1285,36 @@ main() {
   validate_nemoclaw_home
   acquire_lock
 
-  if [[ -n "$do_uninstall" ]]; then
-    do_uninstall
-  fi
-
   if [[ -n "$DRY_RUN" ]]; then
     info "=== DRY RUN -- no changes will be made ==="
   fi
 
-  print_banner
+  case "$mode" in
+    uninstall) do_uninstall ;;
+    upgrade)   do_upgrade ;;
+    rollback)  do_rollback ;;
+    prune)     do_prune ;;
+    "")
+      # Default: fresh install
+      print_banner
 
-  step 1 "Node.js"
-  check_nodejs
+      step 1 3 "Node.js"
+      check_nodejs
 
-  step 2 "NemoClaw CLI"
-  install_nemoclaw
-  verify_nemoclaw
+      step 2 3 "NemoClaw CLI"
+      install_nemoclaw
+      verify_nemoclaw
 
-  step 3 "Onboarding"
-  if command_exists nemoclaw; then
-    run_onboard
-  else
-    warn "Skipping onboarding -- nemoclaw is not on PATH. Run 'nemoclaw onboard' after updating your PATH."
-  fi
+      step 3 3 "Onboarding"
+      if command_exists nemoclaw; then
+        run_onboard
+      else
+        warn "Skipping onboarding -- nemoclaw is not on PATH. Run 'nemoclaw onboard' after updating your PATH."
+      fi
 
-  print_done
+      print_done
+      ;;
+  esac
 }
 
 main "$@"
