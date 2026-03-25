@@ -146,3 +146,11 @@ Previews what actions would be taken without making any changes. Can be combined
 - Version string validation: Only `[a-zA-Z0-9._+-]` is allowed. `..` and slashes are rejected.
 - NEMOCLAW_HOME validation: System directories (`/`, `/usr`, `/etc`, etc.) are rejected.
 - Source hijack prevention: A `package.json` in CWD is only used if CWD matches the installer directory.
+
+## License
+
+Apache License 2.0 -- 元となる [NVIDIA/NemoClaw](https://github.com/NVIDIA/NemoClaw) のライセンスに準拠しています。
+
+## Acknowledgements
+
+本リポジトリのインストールスクリプトは [NVIDIA/NemoClaw の install.sh](https://github.com/NVIDIA/NemoClaw/blob/main/scripts/install.sh) を参考に書き換えたものです。
