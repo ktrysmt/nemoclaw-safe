@@ -149,8 +149,8 @@ Previews what actions would be taken without making any changes. Can be combined
 
 ## License
 
-Apache License 2.0 -- 元となる [NVIDIA/NemoClaw](https://github.com/NVIDIA/NemoClaw) のライセンスに準拠しています。
+Apache License 2.0 -- Licensed under the same terms as the original [NVIDIA/NemoClaw](https://github.com/NVIDIA/NemoClaw).
 
 ## Acknowledgements
 
-本リポジトリのインストールスクリプトは [NVIDIA/NemoClaw の install.sh](https://github.com/NVIDIA/NemoClaw/blob/main/scripts/install.sh) を参考に書き換えたものです。
+The installation script in this repository is based on [NVIDIA/NemoClaw's install.sh](https://github.com/NVIDIA/NemoClaw/blob/main/scripts/install.sh).
