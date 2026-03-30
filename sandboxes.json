@@ -1,0 +1,17 @@
+{
+  "sandboxes": {
+    "my-agent": {
+      "name": "my-agent",
+      "createdAt": "2026-03-24T13:34:31.072Z",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "nimContainer": null,
+      "provider": "nvidia-nim",
+      "gpuEnabled": true,
+      "policies": [
+        "pypi",
+        "npm"
+      ]
+    }
+  },
+  "defaultSandbox": "my-agent"
+}
